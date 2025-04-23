@@ -1,214 +1,97 @@
 import asyncio
-import logging
+import json
 import os
 
-from azure.ai.projects.aio import AIProjectClient
-from azure.ai.projects.models import (
-    Agent,
-    AgentThread,
-    AsyncFunctionTool,
-    AsyncToolSet,
-    BingGroundingTool,
-    CodeInterpreterTool,
-    FileSearchTool,
-)
-from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
+from openai import OpenAI
 
 from sales_data import SalesData
-from stream_event_handler import StreamEventHandler
-from terminal_colors import TerminalColors as tc
 from utilities import Utilities
+from terminal_colors import TerminalColors as tc
 
-logging.basicConfig(level=logging.ERROR)
-logger = logging.getLogger(__name__)
-
+# ─── Configuration ───────────────────────────────────────────────────────────
 load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-AGENT_NAME = "Contoso Sales Agent"
-TENTS_DATA_SHEET_FILE = "datasheet/contoso-tents-datasheet.pdf"
-FONTS_ZIP = "fonts/fonts.zip"
-API_DEPLOYMENT_NAME = os.getenv("MODEL_DEPLOYMENT_NAME")
-PROJECT_CONNECTION_STRING = os.environ["PROJECT_CONNECTION_STRING"]
-BING_CONNECTION_NAME = os.getenv("BING_CONNECTION_NAME")
-MAX_COMPLETION_TOKENS = 10240
-MAX_PROMPT_TOKENS = 20480
-# The LLM is used to generate the SQL queries.
-# Set the temperature and top_p low to get more deterministic results.
-TEMPERATURE = 0.1
-TOP_P = 0.1
-INSTRUCTIONS_FILE = None
-
-
-toolset = AsyncToolSet()
-utilities = Utilities()
-sales_data = SalesData(utilities)
-
-
-project_client = AIProjectClient.from_connection_string(
-    credential=DefaultAzureCredential(),
-    conn_str=PROJECT_CONNECTION_STRING,
-)
-
-functions = AsyncFunctionTool(
+INSTRUCTIONS_FILE = "function_calling.txt"
+function_specs = [
     {
-        sales_data.async_fetch_sales_data_using_sqlite_query,
+        "name": "fetch_sales",
+        "description": "Run a SQL query against the Contoso sales database and return JSON results.",
+        "parameters": {
+            "type": "object",
+            "properties": {"sql": {"type": "string", "description": "A valid SQLite query."}},
+            "required": ["sql"]
+        }
     }
-)
+]
 
-# INSTRUCTIONS_FILE = "instructions/function_calling.txt"
-# INSTRUCTIONS_FILE = "instructions/file_search.txt"
-# INSTRUCTIONS_FILE = "instructions/code_interpreter.txt"
-# INSTRUCTIONS_FILE = "instructions/code_interpreter_multilingual.txt"
-# INSTRUCTIONS_FILE = "instructions/bing_grounding.txt"
+async def chat_loop():
+    util = Utilities()
+    instructions = util.load_instructions(INSTRUCTIONS_FILE)
 
-
-async def add_agent_tools() -> None:
-    """Add tools for the agent."""
-    font_file_info = None
-
-    # Add the functions tool
-    # toolset.add(functions)
-
-    # Add the tents data sheet to a new vector data store
-    # vector_store = await utilities.create_vector_store(
-    #     project_client,
-    #     files=[TENTS_DATA_SHEET_FILE],
-    #     vector_store_name="Contoso Product Information Vector Store",
-    # )
-    # file_search_tool = FileSearchTool(vector_store_ids=[vector_store.id])
-    # toolset.add(file_search_tool)
-
-    # Add the code interpreter tool
-    # code_interpreter = CodeInterpreterTool()
-    # toolset.add(code_interpreter)
-
-    # Add multilingual support to the code interpreter
-    # font_file_info = await utilities.upload_file(project_client, utilities.shared_files_path / FONTS_ZIP)
-    # code_interpreter.add_file(file_id=font_file_info.id)
-
-    # Add the Bing grounding tool
-    # bing_connection = await project_client.connections.get(connection_name=BING_CONNECTION_NAME)
-    # bing_grounding = BingGroundingTool(connection_id=bing_connection.id)
-    # toolset.add(bing_grounding)
-
-    return font_file_info
-
-
-async def initialize() -> tuple[Agent, AgentThread]:
-    """Initialize the agent with the sales data schema and instructions."""
-
-    if not INSTRUCTIONS_FILE:
-        return None, None
-
-    font_file_info = await add_agent_tools()
-
+    sales_data = SalesData()
     await sales_data.connect()
-    database_schema_string = await sales_data.get_database_info()
 
-    try:
-        instructions = utilities.load_instructions(INSTRUCTIONS_FILE)
-        # Replace the placeholder with the database schema string
-        instructions = instructions.replace(
-            "{database_schema_string}", database_schema_string)
+    messages = [{"role": "system", "content": instructions}]
 
-        if font_file_info:
-            # Replace the placeholder with the font file ID
-            instructions = instructions.replace(
-                "{font_file_id}", font_file_info.id)
-
-        print("Creating agent...")
-        agent = await project_client.agents.create_agent(
-            model=API_DEPLOYMENT_NAME,
-            name=AGENT_NAME,
-            instructions=instructions,
-            toolset=toolset,
-            temperature=TEMPERATURE,
-            headers={"x-ms-enable-preview": "true"},
-        )
-        print(f"Created agent, ID: {agent.id}")
-
-        print("Creating thread...")
-        thread = await project_client.agents.create_thread()
-        print(f"Created thread, ID: {thread.id}")
-
-        return agent, thread
-
-    except Exception as e:
-        logger.error("An error occurred initializing the agent: %s", str(e))
-        logger.error("Please ensure you've enabled an instructions file.")
-
-
-async def cleanup(agent: Agent, thread: AgentThread) -> None:
-    """Cleanup the resources."""
-    await project_client.agents.delete_thread(thread.id)
-    await project_client.agents.delete_agent(agent.id)
-    await sales_data.close()
-
-
-async def post_message(thread_id: str, content: str, agent: Agent, thread: AgentThread) -> None:
-    """Post a message to the Azure AI Agent Service."""
-    try:
-        await project_client.agents.create_message(
-            thread_id=thread_id,
-            role="user",
-            content=content,
-        )
-
-        stream = await project_client.agents.create_stream(
-            thread_id=thread.id,
-            agent_id=agent.id,
-            event_handler=StreamEventHandler(
-                functions=functions, project_client=project_client, utilities=utilities),
-            max_completion_tokens=MAX_COMPLETION_TOKENS,
-            max_prompt_tokens=MAX_PROMPT_TOKENS,
-            temperature=TEMPERATURE,
-            top_p=TOP_P,
-            instructions=agent.instructions,
-        )
-
-        async with stream as s:
-            await s.until_done()
-    except Exception as e:
-        utilities.log_msg_purple(
-            f"An error occurred posting the message: {e!s}")
-
-
-async def main() -> None:
-    """
-    Example questions: Sales by region, top-selling products, total shipping costs by region, show as a pie chart.
-    """
-    agent, thread = await initialize()
-    if not agent or not thread:
-        print(f"{tc.BG_BRIGHT_RED}Initialization failed. Ensure you have uncommented the instructions file for the lab.{tc.RESET}")
-        print("Exiting...")
-        return
-
-    cmd = None
-
+    print(f"{tc.GREEN}Type your question (exit/quit to end):{tc.RESET}")
     while True:
-        prompt = input(
-            f"\n\n{tc.GREEN}Enter your query (type exit or save to finish): {tc.RESET}").strip()
-        if not prompt:
-            continue
-
-        cmd = prompt.lower()
-        if cmd in {"exit", "save"}:
+        user_input = input(f"\n{tc.BLUE}User:{tc.RESET} ").strip()
+        if user_input.lower() in {"exit", "quit", "save"}:
             break
 
-        await post_message(agent=agent, thread_id=thread.id, content=prompt, thread=thread)
+        messages.append({"role": "user", "content": user_input})
 
-    if cmd == "save":
-        print("The agent has not been deleted, so you can continue experimenting with it in the Azure AI Foundry.")
-        print(
-            f"Navigate to https://ai.azure.com, select your project, then playgrounds, agents playgound, then select agent id: {agent.id}"
+        # First API call for function determination
+        response = client.chat.completions.create(
+            model="gpt-4o",  # or gpt-4 if available
+            messages=messages,
+            functions=function_specs,
+            function_call="auto",
+            temperature=0.1
         )
-    else:
-        await cleanup(agent, thread)
-        print("The agent resources have been cleaned up.")
 
+        msg = response.choices[0].message
+
+        # If LLM triggers the function
+        if msg.function_call:
+            args_str = msg.function_call.arguments or ""
+            try:
+                args = json.loads(args_str)
+            except json.JSONDecodeError:
+                args = {}
+
+            sql = args.get("sql")
+            if sql:
+                print(f"\n{tc.YELLOW}>>> Calling fetch_sales(sql):{tc.RESET} {sql}\n")
+                result = await sales_data.async_fetch_sales_data_using_sqlite_query(sql)
+
+                # Append the function result
+                messages.append({
+                    "role": "function",
+                    "name": msg.function_call.name,
+                    "content": result
+                })
+
+                # Second call to get the formatted answer
+                followup = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages
+                )
+                assistant_content = followup.choices[0].message.content or ""
+                print(f"{tc.MAGENTA}{assistant_content}{tc.RESET}")
+                messages.append({"role": "assistant", "content": assistant_content})
+            else:
+                print(f"{tc.RED}No SQL query found in function call.{tc.RESET}")
+        else:
+            # Direct LLM reply
+            assistant_content = msg.content or ""
+            print(assistant_content)
+            messages.append({"role": "assistant", "content": assistant_content})
+
+    await sales_data.close()
+    print(f"\n{tc.GREEN}Session ended.{tc.RESET}")
 
 if __name__ == "__main__":
-    print("Starting async program...")
-    asyncio.run(main())
-    print("Program finished.")
+    asyncio.run(chat_loop())
